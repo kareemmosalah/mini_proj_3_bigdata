@@ -1,0 +1,99 @@
+version: '3.8'
+
+# Real-Time Movie Recommendation System
+# Domain: Movies (MovieLens 1M)  |  Focus: Real-Time Intelligence
+#
+# Services:
+#   zookeeper  – Kafka coordination (port 2181)
+#   kafka      – Message broker, 2 partitions (port 9092 external / 29092 internal)
+#   kafka-init – One-shot topic creation
+#   spark      – Persistent Spark container for running PySpark jobs
+
+services:
+
+  # ─── Zookeeper ────────────────────────────────────────────────────────────
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    hostname: zookeeper
+    container_name: zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+
+  # ─── Kafka Broker ─────────────────────────────────────────────────────────
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    hostname: kafka
+    container_name: kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"      # host access (producer, kafka-python)
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: "zookeeper:2181"
+      # Two listeners:
+      #   PLAINTEXT        – internal Docker network (spark container → kafka:29092)
+      #   PLAINTEXT_HOST   – host machine (producer → localhost:9092)
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_NUM_PARTITIONS: 2
+      KAFKA_LOG_RETENTION_HOURS: 2
+
+  # ─── Topic Initializer (runs once, exits) ─────────────────────────────────
+  # Retries until Kafka is ready, then creates the topic with 2 partitions.
+  kafka-init:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: kafka-init
+    depends_on:
+      - kafka
+    entrypoint: ["/bin/bash", "-c"]
+    command:
+      - |
+        echo "Waiting for Kafka to be ready..."
+        until kafka-topics --bootstrap-server kafka:29092 --list > /dev/null 2>&1; do
+          echo "  Kafka not ready yet — retrying in 5s...";
+          sleep 5;
+        done
+        echo "Kafka ready. Creating topic movie-ratings (2 partitions)..."
+        kafka-topics --create \
+          --if-not-exists \
+          --bootstrap-server kafka:29092 \
+          --partitions 2 \
+          --replication-factor 1 \
+          --topic movie-ratings
+        echo "Done."
+        kafka-topics --describe \
+          --bootstrap-server kafka:29092 \
+          --topic movie-ratings
+    restart: "no"
+
+  # ─── Spark (persistent – exec into for jobs) ──────────────────────────────
+  spark:
+    image: apache/spark:3.5.1
+    container_name: spark
+    hostname: spark
+    depends_on:
+      - kafka
+    ports:
+      - "4040:4040"      # Spark Web UI
+    environment:
+      # Spark Kafka connector package (matches Spark 3.5.1 / Scala 2.12)
+      SPARK_KAFKA_PKG: "org.apache.spark:spark-sql-kafka-0-10_2.12:3.5.1"
+      # Kafka address for Spark jobs running inside this container
+      KAFKA_BOOTSTRAP_SERVERS: "kafka:29092"
+    volumes:
+      - .:/workspace                  # project code + data
+      - ivy2-cache:/root/.ivy2        # Maven cache (persists across restarts)
+    working_dir: /workspace
+    # Install numpy (needed by Spark MLlib) then keep container running
+    command: ["/bin/bash", "-c", "pip install numpy --quiet && tail -f /dev/null"]
+    user: root
+
+volumes:
+  ivy2-cache:

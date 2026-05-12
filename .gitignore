@@ -1,0 +1,21 @@
+# Dataset (large, download via data/download_data.py)
+data/ml-1m/
+data/ml-1m.zip
+
+# Generated artifacts (reproduced by running the scripts)
+data/processed/
+models/als_model/
+output/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/

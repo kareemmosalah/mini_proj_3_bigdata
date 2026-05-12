@@ -1,0 +1,4 @@
+# Runtime dependencies for the host machine (producer + data download)
+# Spark runs inside Docker — no pyspark needed on the host.
+
+kafka-python==2.0.2
