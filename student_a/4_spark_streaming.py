@@ -33,10 +33,60 @@ import os
 
 from pyspark.sql import SparkSession
 from pyspark.sql import functions as F
+from pyspark.sql.window import Window
 from pyspark.sql.types import (
     StructType, StructField,
     IntegerType, FloatType, StringType,
 )
+from pyspark.ml.recommendation import ALSModel
+
+
+def load_als_model(spark, model_path):
+    return ALSModel.load(model_path)
+
+
+def generate_recommendations(micro_batch_df, epoch_id, als_model, top_n=5):
+    """
+    foreachBatch sink: top-N recs per unique user, excluding items the user
+    just rated in this micro-batch. Over-fetch then anti-join + re-rank.
+    Latency target: < 5 seconds per batch.
+    """
+    import time
+    from pyspark.sql import functions as F
+
+    t0 = time.time()
+
+    if micro_batch_df.rdd.isEmpty():
+        print(f"[Recommendation latency: {time.time() - t0:.3f}s] (empty batch)")
+        return
+
+    over_fetch = top_n * 4
+    users = micro_batch_df.select("user_id").distinct()
+    raw = als_model.recommendForUserSubset(users, over_fetch)
+
+    exploded = (
+        raw.select("user_id", F.explode("recommendations").alias("r"))
+        .select(
+            "user_id",
+            F.col("r.item_id").alias("item_id"),
+            F.round("r.rating", 2).alias("predicted_rating"),
+        )
+    )
+
+    just_rated = micro_batch_df.select("user_id", "item_id").distinct()
+    filtered = exploded.join(just_rated, ["user_id", "item_id"], "left_anti")
+
+    win = Window.partitionBy("user_id").orderBy(F.col("predicted_rating").desc())
+    top = (
+        filtered.withColumn("rk", F.row_number().over(win))
+        .filter(F.col("rk") <= top_n)
+        .drop("rk")
+        .orderBy("user_id", F.col("predicted_rating").desc())
+    )
+    top.show(top_n * 3, truncate=False)
+
+    latency = time.time() - t0
+    print(f"[Recommendation latency: {latency:.3f}s]")
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 KAFKA_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
@@ -137,7 +187,7 @@ def main():
     )
 
     # TODO_B-1 ── Watermark for late data handling (Student B adds this line):
-    # valid_stream = valid_stream.withWatermark("event_time", "1 minute")
+    valid_stream = valid_stream.withWatermark("event_time", "1 minute")
     # Once added, change parquet sinks below to outputMode("append").
 
     # ── 4a. Window: average rating per item ──────────────────────────────
@@ -180,17 +230,53 @@ def main():
         )
     )
 
-    # TODO_B-2 ── Trending score (Student B adds after avg_rating_per_item):
-    # trending = avg_rating_per_item.withColumn(
-    #     "trending_score",
-    #     F.round(F.col("avg_rating") * F.log1p(F.col("interaction_count")), 3)
-    # )
+    # TODO_B-2 ── Trending score
+    trending = avg_rating_per_item.withColumn(
+        "trending_score",
+        # Score = avg_rating × log(1 + interactions)
+        # High rating AND high volume → high score
+        F.round(F.col("avg_rating") * F.log1p(F.col("interaction_count").cast("double")), 3)
+    )
+    # NOTE: orderBy from the spec snippet is omitted — Spark Structured Streaming
+    # disallows sort on streaming DataFrames in update output mode. The console
+    # sink will still show all trending rows (unsorted).
 
-    # TODO_B-3 ── Alert system (Student B adds):
-    # alerts = avg_rating_per_item.filter(F.col("avg_rating") > 4.5)
+    # TODO_B-3 ── Alert system
+    ALERT_RATING_THRESHOLD    = 4.5
+    ALERT_ACTIVITY_THRESHOLD  = 3    # interactions per user per window (lowered for realistic load)
 
-    # TODO_B-4 ── ML integration (Student B adds after loading ALS model):
-    # recs_stream = valid_stream.transform(lambda df: generate_recommendations(df, als_model))
+    # Alert: item average crosses threshold
+    item_alerts = avg_rating_per_item.filter(
+        (F.col("avg_rating") >= ALERT_RATING_THRESHOLD)
+        & (F.col("interaction_count") >= 3)   # ignore single-vote flukes
+    ).withColumn(
+        "alert_msg",
+        F.concat_ws(" ",
+            F.lit("ALERT: Item"),
+            F.col("item_id").cast("string"),
+            F.lit("is trending — avg_rating ="),
+            F.col("avg_rating").cast("string"),
+            F.lit(f"(threshold ≥ {ALERT_RATING_THRESHOLD})"),
+        )
+    )
+
+    # Alert: user activity spike
+    user_alerts = interactions_per_user.filter(
+        F.col("interaction_count") >= ALERT_ACTIVITY_THRESHOLD
+    ).withColumn(
+        "alert_msg",
+        F.concat_ws(" ",
+            F.lit("ALERT: User"),
+            F.col("user_id").cast("string"),
+            F.lit("spike —"),
+            F.col("interaction_count").cast("string"),
+            F.lit("interactions in window"),
+        )
+    )
+
+    # TODO_B-4 ── ML integration: load ALS model for streaming recommendations
+    MODEL_PATH = os.path.join(BASE_DIR, "models", "als_model")
+    als_model  = load_als_model(spark, MODEL_PATH)
 
     # ── 5. Sinks ──────────────────────────────────────────────────────────
 
@@ -227,6 +313,93 @@ def main():
         .option("path", os.path.join(OUTPUT_DIR, "raw_events"))
         .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "raw_events"))
         .trigger(processingTime="30 seconds")
+        .start()
+    )
+
+    # B-1: Parquet sink for avg_rating_per_item (append mode, enabled by watermark)
+    q_items_parquet = (
+        avg_rating_per_item.writeStream
+        .outputMode("append")
+        .format("parquet")
+        .option("path", os.path.join(OUTPUT_DIR, "avg_rating_per_item"))
+        .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "avg_rating"))
+        .trigger(processingTime="30 seconds")
+        .start()
+    )
+
+    # B-2: Top-K trending via foreachBatch (sorts inside the sink, which is allowed)
+    def _show_top_trending(batch_df, _eid, k=5):
+        if batch_df.rdd.isEmpty():
+            return
+        (
+            batch_df.orderBy(F.col("trending_score").desc())
+            .limit(k)
+            .show(k, truncate=False)
+        )
+
+    q_trending = (
+        trending.writeStream
+        .outputMode("update")
+        .foreachBatch(_show_top_trending)
+        .queryName("trending_items")
+        .trigger(processingTime="10 seconds")
+        .start()
+    )
+
+    # B-3: Console sinks for alerts
+    q_item_alerts = (
+        item_alerts.select("window_start", "window_end", "item_id", "avg_rating", "alert_msg")
+        .writeStream
+        .outputMode("update")
+        .format("console")
+        .option("truncate", "false")
+        .queryName("item_alerts")
+        .trigger(processingTime="10 seconds")
+        .start()
+    )
+
+    q_user_alerts = (
+        user_alerts.select("window_start", "window_end", "user_id", "interaction_count", "alert_msg")
+        .writeStream
+        .outputMode("update")
+        .format("console")
+        .option("truncate", "false")
+        .queryName("user_alerts")
+        .trigger(processingTime="10 seconds")
+        .start()
+    )
+
+    # Parquet sinks for alerts (append; watermark inherited from valid_stream)
+    q_item_alerts_parquet = (
+        item_alerts.select("window_start", "window_end", "item_id", "avg_rating",
+                           "interaction_count", "alert_msg")
+        .writeStream
+        .outputMode("append")
+        .format("parquet")
+        .option("path", os.path.join(OUTPUT_DIR, "alerts", "item"))
+        .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "alerts_item"))
+        .trigger(processingTime="30 seconds")
+        .start()
+    )
+
+    q_user_alerts_parquet = (
+        user_alerts.select("window_start", "window_end", "user_id",
+                           "interaction_count", "alert_msg")
+        .writeStream
+        .outputMode("append")
+        .format("parquet")
+        .option("path", os.path.join(OUTPUT_DIR, "alerts", "user"))
+        .option("checkpointLocation", os.path.join(CHECKPOINT_DIR, "alerts_user"))
+        .trigger(processingTime="30 seconds")
+        .start()
+    )
+
+    # B-4: Streaming recommendations via foreachBatch
+    q_recs = (
+        valid_stream.writeStream
+        .foreachBatch(lambda df, eid: generate_recommendations(df, eid, als_model))
+        .trigger(processingTime="10 seconds")
+        .queryName("recommendations")
         .start()
     )
 
